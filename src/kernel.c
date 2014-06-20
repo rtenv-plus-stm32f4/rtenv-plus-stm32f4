@@ -722,6 +722,7 @@ void first()
 #define INTR_EVENT(intr) (FILE_LIMIT + (intr) + 15) /* see INTR_LIMIT */
 #define INTR_EVENT_REVERSE(event) ((event) - FILE_LIMIT - 15)
 #define TIME_EVENT (FILE_LIMIT + INTR_LIMIT)
+#define SEMAPHORE_EVENT TIME_EVENT + 1
 
 int intr_release(struct event_monitor *monitor, int event,
                  struct task_control_block *task, void *data)
@@ -734,6 +735,12 @@ int time_release(struct event_monitor *monitor, int event,
 {
     int *tick_count = data;
     return task->stack->r0 == *tick_count;
+}
+
+int semaphore_release(struct event_monitor *monitor, int event,
+                 struct task_control_block *task, void *data)
+{
+    return 1;
 }
 
 /* System resources */
@@ -757,6 +764,9 @@ int main()
 	struct task_control_block *task;
 	int timeup;
 	unsigned int tick_count = 0;
+
+	/* Semaphore */
+	semaphore_t *block_sem[TASK_LIMIT];
 
 	SysTick_Config(configCPU_CLOCK_HZ / configTICK_RATE_HZ);
 
@@ -785,7 +795,11 @@ int main()
 	for (i = -15; i < INTR_LIMIT - 15; i++)
 	    event_monitor_register(&event_monitor, INTR_EVENT(i), intr_release, 0);
 
+	/* Time event */
 	event_monitor_register(&event_monitor, TIME_EVENT, time_release, &tick_count);
+	
+	/* Semaphore event */
+	event_monitor_register(&event_monitor, SEMAPHORE_EVENT, semaphore_release, 0);
 
     /* Initialize first thread */
 	tasks[task_count].stack = (void*)init_task(stacks[task_count], &first);
@@ -795,6 +809,7 @@ int main()
 	list_push(&ready_list[tasks[task_count].priority], &tasks[task_count].list);
 	task_count++;
 
+	int wait_called = 0;
 	while (1) {
 		tasks[current_task].stack = activate(tasks[current_task].stack);
 		tasks[current_task].status = TASK_READY;
@@ -930,7 +945,7 @@ int main()
 			}
 			break;
 		case 0xa: /* lseek */
-            {
+		{
 		        /* Check fd is valid */
 		        int fd = tasks[current_task].stack->r0;
 		        if (fd < FILE_LIMIT && files[fd]) {
@@ -949,7 +964,36 @@ int main()
 			    else {
 			        tasks[current_task].stack->r0 = -1;
 			    }
-			} break;
+		} 
+			break;
+		case 0xb: /* signal */
+		{
+			semaphore_t *sem_tmp = (semaphore_t*)tasks[current_task].stack->r0;
+			(*sem_tmp)++;
+			
+			break;
+		}
+		case 0xc: /* wait */
+		{
+			wait_called = 1;
+			semaphore_t *sem_tmp = (semaphore_t*)tasks[current_task].stack->r0;
+
+			if(*sem_tmp == 0) {
+				tasks[current_task].status = TASK_WAIT_SEM;
+				
+				//Save the semaphore's address
+				block_sem[current_task] = sem_tmp;				
+
+				//Block the current task
+				event_monitor_block(&event_monitor,
+				SEMAPHORE_EVENT,
+				&tasks[current_task]);
+			} else {
+				(*sem_tmp)--;
+			}
+				
+			break;
+		}
 		default: /* Catch all interrupts */
 			if ((int)tasks[current_task].stack->r7 < 0) {
 				unsigned int intr = -tasks[current_task].stack->r7 - 16;
@@ -968,7 +1012,16 @@ int main()
 			}
 		}
 
-        /* Rearrange ready list and event list */
+		/* Check semaphore's status */
+		if((tasks[current_task].status == TASK_WAIT_SEM) && (wait_called == 0)) {
+			if(block_sem[current_task] > 0) {
+				tasks[current_task].status = TASK_READY;	
+			
+				event_monitor_release(&event_monitor, SEMAPHORE_EVENT);
+			}		
+		}
+
+	        /* Rearrange ready list and event list */
 		event_monitor_serve(&event_monitor);
 
 		/* Check whether to context switch */
